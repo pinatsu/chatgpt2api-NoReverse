@@ -8,7 +8,7 @@
 // @grant        none
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     const WS_URL = 'ws://localhost:8000/ws';
@@ -47,7 +47,7 @@
     }
 
     // --- DOM Interaction ---
-    
+
     function simulateInput(prompt) {
         // Find the input element. ChatGPT currently uses a ProseMirror editable div.
         const inputDiv = document.querySelector('#prompt-textarea');
@@ -60,14 +60,14 @@
         // The most reliable way is often to focus it and trigger an paste or input event 
         // that looks genuine.
         inputDiv.focus();
-        
+
         // Clear existing
         inputDiv.innerHTML = `<p>${prompt.replace(/\n/g, '<br>')}</p>`;
-        
+
         // Dispatch an input event so React state updates
         const inputEvent = new Event('input', { bubbles: true, cancelable: true });
         inputDiv.dispatchEvent(inputEvent);
-        
+
         return true;
     }
 
@@ -81,35 +81,77 @@
         return false;
     }
 
+    let pollInterval = null;
+    let idleTimeout = null;
+
     function startListeningForReply(taskId) {
-        if (observer) {
-            observer.disconnect();
-        }
+        if (pollInterval) clearInterval(pollInterval);
         lastProcessedText = "";
 
-        // Wait a moment for the new assistant bubble to appear in the DOM
-        setTimeout(() => {
-            // Find all assistant messages
-            const messages = document.querySelectorAll('div[data-message-author-role="assistant"]');
-            if (messages.length === 0) {
-                console.error('[ChatGPT2api] No assistant message found to observe.');
-                sendError(taskId, "Could not find assistant message element.");
-                return;
-            }
-            
-            // The last one is the current reply
-            const targetNode = messages[messages.length - 1];
+        // Broadest possible selector to find the assistant's message container or text block
+        const getCandidates = () => Array.from(document.querySelectorAll('.markdown, .prose, [data-message-author-role="assistant"]'));
 
-            // Setup MutationObserver to watch for text additions
-            observer = new MutationObserver((mutationsList, obs) => {
-                const fullText = targetNode.textContent;
-                
-                // Calculate the incremental chunk
-                if (fullText.length > lastProcessedText.length && fullText.startsWith(lastProcessedText)) {
-                    const chunk = fullText.substring(lastProcessedText.length);
-                    lastProcessedText = fullText;
-                    
-                    // Send chunk to server
+        let initialLastNode = getCandidates().pop();
+        let initialText = initialLastNode ? initialLastNode.textContent : "";
+
+        let waitAttempts = 0;
+        let checkInterval = setInterval(() => {
+            waitAttempts++;
+
+            const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="停止" i], button[data-testid*="stop" i], #composer-submit-button.composer-secondary-button-color');
+
+            const currentCandidates = getCandidates();
+            const currentLastNode = currentCandidates.pop();
+            const currentText = currentLastNode ? currentLastNode.textContent : "";
+
+            // Generation has started if: a new message node appears, the text of the last node changes, or the stop button appears.
+            const isNewNode = currentLastNode && currentLastNode !== initialLastNode;
+            const textChanged = currentLastNode && currentLastNode === initialLastNode && currentText !== initialText;
+
+            if (stopBtn || isNewNode || textChanged) {
+                clearInterval(checkInterval);
+                startPolling(taskId);
+            } else if (waitAttempts > 60) { // 30 seconds
+                clearInterval(checkInterval);
+                console.error('[ChatGPT2api] Timeout waiting for assistant reply bubble to appear.');
+                sendError(taskId, "Timeout waiting for assistant reply bubble to appear.");
+                finishTask(taskId);
+            }
+        }, 500);
+    }
+
+    function startPolling(taskId) {
+        console.log('[ChatGPT2api] Started polling reply...');
+
+        pollInterval = setInterval(() => {
+            const candidates = document.querySelectorAll('.markdown, .prose, [data-message-author-role="assistant"]');
+            if (candidates.length === 0) return;
+
+            // Always read the last assistant message on the page
+            const targetNode = candidates[candidates.length - 1];
+            // Extract text from .markdown if it exists inside the bubble, otherwise fallback to the whole bubble
+            const mdNode = targetNode.querySelector('.markdown, .prose');
+            const fullText = (mdNode ? mdNode.textContent : targetNode.textContent) || "";
+
+            if (fullText.length > lastProcessedText.length && fullText.startsWith(lastProcessedText)) {
+                const chunk = fullText.substring(lastProcessedText.length);
+                lastProcessedText = fullText;
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        action: 'chunk',
+                        task_id: taskId,
+                        content: chunk
+                    }));
+                }
+            } else if (fullText.length > 0 && !fullText.startsWith(lastProcessedText)) {
+                let i = 0;
+                while (i < fullText.length && i < lastProcessedText.length && fullText[i] === lastProcessedText[i]) {
+                    i++;
+                }
+                const chunk = fullText.substring(i);
+                if (chunk.length > 0) {
+                    lastProcessedText = fullText.substring(0, i) + chunk;
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({
                             action: 'chunk',
@@ -118,46 +160,59 @@
                         }));
                     }
                 }
+            }
 
-                // Check if generation is done (simplified approach: look for the stop button vs regenerate button)
-                // If there's a button with data-testid="stop-button", it's generating.
-                // If it's gone and we see say "copy" or similar, or it's just stable.
-                const stopBtn = document.querySelector('button[data-testid="stop-button"]');
-                if (!stopBtn && fullText.length > 0) {
-                    // It might be done. Wait a tiny bit to be sure no more DOM updates are coming
-                    setTimeout(() => {
-                        const checkStopBtn = document.querySelector('button[data-testid="stop-button"]');
+            // Check if generation is done (stop button disappeared)
+            const stopBtnSelector = 'button[aria-label*="Stop" i], button[aria-label*="停止" i], button[data-testid*="stop" i], #composer-submit-button.composer-secondary-button-color';
+            const stopBtn = document.querySelector(stopBtnSelector);
+
+            if (!stopBtn && fullText.length > 0) {
+                if (!idleTimeout) {
+                    idleTimeout = setTimeout(() => {
+                        // Double check after 1 second
+                        const checkStopBtn = document.querySelector(stopBtnSelector);
                         if (!checkStopBtn) {
                             finishTask(taskId);
+                        } else {
+                            idleTimeout = null;
                         }
-                    }, 500);
+                    }, 1000);
                 }
-            });
-
-            observer.observe(targetNode, { characterData: true, childList: true, subtree: true });
-            console.log('[ChatGPT2api] Started observing reply...');
-        }, 1000); // 1s delay to let the UI create the bubble
+            } else if (stopBtn) {
+                if (idleTimeout) {
+                    clearTimeout(idleTimeout);
+                    idleTimeout = null;
+                }
+            }
+        }, 100);
     }
 
     function handleGenerate(taskId, prompt) {
         currentTask = taskId;
-        
+
         if (!simulateInput(prompt)) {
             sendError(taskId, "Failed to input prompt");
             return;
         }
 
-        // Give React a moment to update the send button state based on the input
         setTimeout(() => {
             if (!clickSendButton()) {
                 sendError(taskId, "Failed to click send button");
                 return;
             }
             startListeningForReply(taskId);
-        }, 100);
+        }, 500);
     }
 
     function finishTask(taskId) {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+        if (idleTimeout) {
+            clearTimeout(idleTimeout);
+            idleTimeout = null;
+        }
         if (observer) {
             observer.disconnect();
             observer = null;
