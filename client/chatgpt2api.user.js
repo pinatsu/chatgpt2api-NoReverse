@@ -131,7 +131,12 @@
             const targetNode = candidates[candidates.length - 1];
             // Extract text from .markdown if it exists inside the bubble, otherwise fallback to the whole bubble
             const mdNode = targetNode.querySelector('.markdown, .prose');
-            const fullText = (mdNode ? mdNode.textContent : targetNode.textContent) || "";
+            let fullText = (mdNode ? mdNode.textContent : targetNode.textContent) || "";
+            
+            // Remove trailing whitespaces/newlines. This prevents temporary HTML formatting
+            // or cursor elements from causing duplicated newlines like "childre\n\nn".
+            // Legitimate newlines will be preserved once non-whitespace characters follow them.
+            fullText = fullText.replace(/[\s\u200B-\u200D\uFEFF]+$/, '');
 
             if (fullText.length > lastProcessedText.length && fullText.startsWith(lastProcessedText)) {
                 const chunk = fullText.substring(lastProcessedText.length);
