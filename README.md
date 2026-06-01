@@ -1,4 +1,7 @@
 # ChatGPT2api
+> [!WARNING]
+> This is a **vibe-coded toy** for fun. PR welcome.
+> 这只是一个 vibe coding 玩具。 欢迎PR。
 
 将网页版 ChatGPT 封装为本地标准 OpenAI API 格式的轻量级工具。
 
